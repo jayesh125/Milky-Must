@@ -1,26 +1,31 @@
 import random
+from django.http import HttpResponse
 from django.utils import timezone
-from datetime import timedelta
+from requests import request
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework import status, permissions
+from rest_framework import status, permissions, generics
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenRefreshView
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
+from django.contrib.auth import authenticate
+from django.contrib.auth.hashers import make_password
 
-from .models import User, OTP
-from .serializers import SendOTPSerializer, VerifyOTPSerializer, UserSerializer
+from .models import Profile, User, OTP
+from .serializers import (
+    SendOTPSerializer, VerifyOTPSerializer,
+    ProfileSerializer, UserSerializer, SetPasswordSerializer
+)
 
-# Replace this with Twilio/MSG91 etc.
+# Replace with Twilio/MSG91/etc in production
 def send_sms(phone, code):
-    # TODO: integrate real SMS. For dev: just log to console.
     print(f"[DEV SMS] OTP for {phone}: {code}")
     return True
 
 def generate_otp():
     return str(random.randint(100000, 999999))
 
-class SendOTPView(APIView):
+class SendOTPRegisterView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
@@ -29,30 +34,88 @@ class SendOTPView(APIView):
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         phone = serializer.validated_data["phone"]
+
+        # ❌ block if user already exists
+        if User.objects.filter(phone=phone).exists():
+            return Response(
+                {"error": "User with this phone number already exists"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         code = generate_otp()
+        otp = OTP(phone=phone, code=code)
+        otp.set_expiry(minutes=5)
+        otp.save()
 
-        # Fetch last OTP row for this phone (if exists) to enforce rate limits
-        last = OTP.objects.filter(phone=phone).order_by('-created_at').first()
-        if last:
-            # respect 10-minute window, max 5 sends
-            if not last.within_window(minutes=10, limit=5):
-                return Response({"error": "Too many OTP requests. Try again later."},
-                                status=status.HTTP_429_TOO_MANY_REQUESTS)
-            # continue same window
-            otp = OTP(phone=phone, code=code, window_start=last.window_start,
-                      send_count_window=last.send_count_window + 1)
-            otp.set_expiry(minutes=5)
-            otp.save()
-        else:
-            otp = OTP(phone=phone, code=code)
-            otp.set_expiry(minutes=5)
-            otp.save()
-
-        # send SMS
         send_sms(phone, code)
-        return Response({"message": "OTP sent"}, status=status.HTTP_200_OK)
+        return Response({"message": "OTP sent for registration"}, status=status.HTTP_200_OK)
 
-class VerifyOTPView(APIView):
+
+class SendOTPLoginView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        serializer = SendOTPSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        phone = serializer.validated_data["phone"]
+
+        # ❌ block if user does not exist
+        if not User.objects.filter(phone=phone).exists():
+            return Response(
+                {"error": "User with this phone number is not registered"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        code = generate_otp()
+        otp = OTP(phone=phone, code=code)
+        otp.set_expiry(minutes=5)
+        otp.save()
+
+        send_sms(phone, code)
+        return Response({"message": "OTP sent for login"}, status=status.HTTP_200_OK)
+
+class VerifyOTPRegisterView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        serializer = VerifyOTPSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        phone = serializer.validated_data["phone"]
+        code = serializer.validated_data["code"]
+
+        otp_obj = OTP.objects.filter(
+            phone=phone, code=code, is_used=False
+        ).order_by('-created_at').first()
+
+        if not otp_obj or otp_obj.is_expired():
+            return Response({"error": "Invalid or expired OTP"}, status=status.HTTP_400_BAD_REQUEST)
+
+        otp_obj.is_used = True
+        otp_obj.save(update_fields=["is_used"])
+
+        # ❌ if user exists, block
+        if User.objects.filter(phone=phone).exists():
+            return Response({"error": "User already exists"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # ✅ create new user and profile
+        user = User.objects.create(phone=phone)
+        profile, _ = Profile.objects.get_or_create(user=user)  # ensure profile is attached
+
+        refresh = RefreshToken.for_user(user)
+
+        # ✅ always include profile.is_complete in response
+        return Response({
+            "message": "OTP verified, new user created",
+            "user": UserSerializer(user).data,
+            "access": str(refresh.access_token),
+            "refresh": str(refresh),
+        }, status=status.HTTP_200_OK)
+
+class VerifyOTPLoginView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
@@ -64,34 +127,27 @@ class VerifyOTPView(APIView):
         code = serializer.validated_data["code"]
 
         otp_obj = OTP.objects.filter(phone=phone, code=code, is_used=False).order_by('-created_at').first()
-        if not otp_obj:
-            return Response({"error": "Invalid OTP"}, status=status.HTTP_400_BAD_REQUEST)
+        if not otp_obj or otp_obj.is_expired():
+            return Response({"error": "Invalid or expired OTP"}, status=status.HTTP_400_BAD_REQUEST)
 
-        if otp_obj.is_expired():
-            return Response({"error": "OTP expired"}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Mark OTP used
         otp_obj.is_used = True
         otp_obj.save(update_fields=["is_used"])
 
-        user, _ = User.objects.get_or_create(phone=phone)
+        # ❌ if user not exist → fail
+        try:
+            user = User.objects.get(phone=phone)
+        except User.DoesNotExist:
+            return Response({"error": "User not registered"}, status=status.HTTP_404_NOT_FOUND)
 
-        # Issue JWT tokens
         refresh = RefreshToken.for_user(user)
-        access = refresh.access_token
-
         return Response({
-            "message": "OTP verified",
+            "message": "OTP verified, login successful",
             "user": UserSerializer(user).data,
-            "access": str(access),
+            "access": str(refresh.access_token),
             "refresh": str(refresh),
         }, status=status.HTTP_200_OK)
 
 class LogoutView(APIView):
-    """
-    Blacklist the provided refresh token (logout from this device).
-    Body: {"refresh": "<refresh_token>"}
-    """
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
@@ -106,9 +162,6 @@ class LogoutView(APIView):
         return Response({"message": "Logged out"}, status=status.HTTP_200_OK)
 
 class LogoutAllView(APIView):
-    """
-    Logout from all devices by blacklisting all outstanding tokens of the current user.
-    """
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
@@ -121,12 +174,97 @@ class LogoutAllView(APIView):
                 pass
         return Response({"message": "Logged out from all devices"}, status=status.HTTP_200_OK)
 
-class MeView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get(self, request):
-        return Response(UserSerializer(request.user).data, status=status.HTTP_200_OK)
-
-# Optional: subclass refresh view so your route stays under /auth/
 class MyTokenRefreshView(TokenRefreshView):
     permission_classes = [permissions.AllowAny]
+
+class MeView(generics.RetrieveAPIView):
+    serializer_class = UserSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_object(self):
+        return self.request.user
+
+class ProfileUpdateView(generics.UpdateAPIView):
+    serializer_class = ProfileSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_object(self):
+        # profile is auto-created via signal; but just in case:
+        if not hasattr(self.request.user, "profile"):
+            from .models import Profile
+            Profile.objects.create(user=self.request.user)
+        return self.request.user.profile
+
+    def patch(self, request, *args, **kwargs):
+        # allow partial updates easily
+        return super().patch(request, *args, **kwargs)
+
+    def options(self, request, *args, **kwargs):
+        """
+        Explicitly handle the OPTIONS preflight request.
+        This is a failsafe to ensure CORS headers are correctly returned.
+        """
+        response = HttpResponse()
+        response['Allow'] = ', '.join(['GET', 'OPTIONS', 'PATCH'])
+        return response
+
+
+class SetPasswordView(APIView):
+    """
+    Set (or reset) password AFTER OTP login.
+    Use Authorization: Bearer <access>  
+    Body: {"password": "..."}
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        serializer = SetPasswordSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        password = serializer.validated_data["password"]
+        request.user.password = make_password(password)
+        request.user.save(update_fields=["password"])
+        return Response({"message": "Password set successfully"}, status=status.HTTP_200_OK)
+
+class PhonePasswordLoginView(APIView):
+    """
+    Login with phone + password.
+    Body: {"phone": "...", "password": "..."}
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        phone = request.data.get("phone")
+        password = request.data.get("password")
+
+        if not phone or not password:
+            return Response(
+                {"error": "Phone and password required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Check if user exists first
+        try:
+            user_obj = User.objects.get(phone=phone)
+        except User.DoesNotExist:
+            return Response(
+                {"error": "User not registered"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Authenticate user with password
+        user = authenticate(request, username=phone, password=password)
+        if not user:
+            return Response(
+                {"error": "Invalid password"},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
+        # Success → issue tokens
+        refresh = RefreshToken.for_user(user)
+        return Response({
+            "access": str(refresh.access_token),
+            "refresh": str(refresh),
+            "user": UserSerializer(user).data
+        }, status=status.HTTP_200_OK)
