@@ -17,7 +17,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = 'django-insecure-3*4zqzsje%w_39i+xh(e5%q)j5&14vr0v)&9hfv#sh4*gs#g)i'
 DEBUG = True
 
-ALLOWED_HOSTS = ["*", "10.0.2.2", "192.168.1.9", "localhost","10.238.141.144"]
+ALLOWED_HOSTS = ["*", "10.0.2.2", "192.168.1.10", "localhost","10.238.141.144"]
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -116,6 +116,11 @@ SIMPLE_JWT = {
     "BLACKLIST_AFTER_ROTATION": True,
     "AUTH_HEADER_TYPES": ("Bearer",),
 }
+
+AUTHENTICATION_BACKENDS = [
+    "django.contrib.auth.backends.ModelBackend",  # keep this for admin users
+    "accounts.backends.PhoneBackend",             # custom backend for phone login
+]
 
 # Custom user
 AUTH_USER_MODEL = "accounts.User"
